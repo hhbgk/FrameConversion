@@ -7,27 +7,36 @@
 #define JNI_CLASS_IJKPLAYER     "com/hhbgk/h264tojpg/api/H264ToJpg"
 #define NELEM(x) ((int) (sizeof(x) / sizeof((x)[0])))
 
-static JavaVM* g_jvm = NULL;
-static jobject g_obj = NULL;
+static JavaVM *gJVM = NULL;
+static jobject gObj = NULL;
 static jmethodID on_data_prepared_method_id;
 
 static void data_handler(uint8_t *data, int size){
     logd("%s", __func__);
-
+    jboolean isAttached = JNI_FALSE;
     JNIEnv *env = NULL;
-    if((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != JNI_OK){
-        loge("%s: AttachCurrentThread() failed", __FUNCTION__);
-        return -1;
+    if ((*gJVM)->GetEnv(gJVM, (void**) &env, JNI_VERSION_1_6) < 0)
+    {
+        if ((*gJVM)->AttachCurrentThread(gJVM, &env, NULL) < 0)
+        {
+            loge("AttachCurrentThread failed");
+            return;
+        }
+        isAttached = JNI_TRUE;
     }
+    assert(env != NULL);
 
     jbyteArray jArray = (*env)->NewByteArray(env, size);
     (*env)->SetByteArrayRegion(env, jArray, 0, size, (jbyte*)data);
-    (*env)->CallVoidMethod(env, g_obj, on_data_prepared_method_id, jArray);
+    (*env)->CallVoidMethod(env, gObj, on_data_prepared_method_id, jArray);
     (*env)->DeleteLocalRef(env, jArray);
+    if (isAttached)
+        (*gJVM)->DetachCurrentThread(gJVM);
+    logi("%s: over....", __func__);
 }
 
-static int convert_to_jpg(AVFrame* pFrame, int width, int height, const char *out_file){
-    logd("%s", __func__);
+static int convert_yuv_to_jpg(AVFrame* pFrame, int width, int height, const char *out_file){
+    logi("%s", __func__);
 	AVFormatContext* pFormatCtx;
 	AVOutputFormat* fmt;
 	AVStream* video_st;
@@ -36,7 +45,6 @@ static int convert_to_jpg(AVFrame* pFrame, int width, int height, const char *ou
 	AVPacket pkt;
 	int y_size;
 	int got_picture=0;
-	int size;
 	int ret=0;
 
     //Method 1
@@ -98,7 +106,7 @@ static int convert_to_jpg(AVFrame* pFrame, int width, int height, const char *ou
 		loge("Encode Error.");
 		return -1;
 	}
-	if (got_picture==1){
+	if (got_picture){
 		loge("pkt data size=%d, ret=%d", pkt.size, ret);
 		pkt.stream_index = video_st->index;
 		ret = av_write_frame(pFormatCtx, &pkt);
@@ -119,21 +127,19 @@ static int convert_to_jpg(AVFrame* pFrame, int width, int height, const char *ou
 	return 0;
 }
 
-static int h264_decode(const char *input_filename, const char *output_filename){
+static int decode_video(const char *input_filename, const char *output_filename){
     AVCodec *codec = NULL;
     AVCodecContext *origin_ctx = NULL, *ctx= NULL;
     AVFrame *fr = NULL;
     uint8_t *byte_buffer = NULL;
     AVPacket pkt;
     AVFormatContext *fmt_ctx = NULL;
-    int number_of_written_bytes;
     int video_stream;
     int got_frame = 0;
     int byte_buffer_size;
     int i = 0;
     int result;
     int end_of_stream = 0;
-    static int get_one = 1;
 
     av_register_all();
 
@@ -195,7 +201,7 @@ static int h264_decode(const char *input_filename, const char *output_filename){
         return AVERROR(ENOMEM);
     }
 
-    loge("#tb %d: %d/%d\n", video_stream, fmt_ctx->streams[video_stream]->time_base.num, fmt_ctx->streams[video_stream]->time_base.den);
+    //loge("#tb %d: %d/%d\n", video_stream, fmt_ctx->streams[video_stream]->time_base.num, fmt_ctx->streams[video_stream]->time_base.den);
     i = 0;
     av_init_packet(&pkt);
     do {
@@ -213,19 +219,17 @@ static int h264_decode(const char *input_filename, const char *output_filename){
             result = avcodec_decode_video2(ctx, fr, &got_frame, &pkt);
             if (result < 0) {
                 loge("Error decoding frame");
-                return result;
+                break;
             }
             if (got_frame) {
-            	if(get_one){
-            		get_one = 0;
-            		convert_to_jpg(fr, ctx->width, ctx->height, output_filename);
-            	}
+            	result = convert_yuv_to_jpg(fr, ctx->width, ctx->height, output_filename);
+            	break;
             }
             av_packet_unref(&pkt);
             av_init_packet(&pkt);
         }
         i++;
-    } while (!end_of_stream || got_frame || get_one);
+    } while (!end_of_stream);
 
     av_packet_unref(&pkt);
     av_frame_free(&fr);
@@ -233,26 +237,27 @@ static int h264_decode(const char *input_filename, const char *output_filename){
     avformat_close_input(&fmt_ctx);
     avcodec_free_context(&ctx);
     av_freep(&byte_buffer);
-    return 0;
+    if (result >=0)
+        return 0;
+    else
+        return result;
 }
 
 static jboolean jni_request_h264_jpg(JNIEnv *env, jobject thiz, jstring jfile, jstring joutput_file){
-    char *file_name = (*env)->GetStringUTFChars(env, jfile, NULL);
-    char *output_file = (*env)->GetStringUTFChars(env, joutput_file, NULL);
-    if (h264_decode(file_name, output_file) != 0){
-        (*env)->DeleteLocalRef(env, jfile);
-        return JNI_FALSE;
-    }
-    (*env)->DeleteLocalRef(env, jfile);
-    return JNI_TRUE;
+    const char *file_name = (*env)->GetStringUTFChars(env, jfile, NULL);
+    const char *output_file = (*env)->GetStringUTFChars(env, joutput_file, NULL);
+    int ret = decode_video(file_name, output_file);
+    (*env)->ReleaseStringUTFChars(env, jfile, file_name);
+    (*env)->ReleaseStringUTFChars(env, joutput_file, output_file);
+    return ret == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
 static void jni_native_init(JNIEnv *env, jobject thiz){
     logd("%s", __func__);
     //保存全局JVM以便在子线程中使用
-    (*env)->GetJavaVM(env,&g_jvm);
+    (*env)->GetJavaVM(env,&gJVM);
     //不能直接赋值(g_obj = thiz)
-    g_obj = (*env)->NewGlobalRef(env, thiz);
+    gObj = (*env)->NewGlobalRef(env, thiz);
 
     jclass clazz = (*env)->GetObjectClass(env, thiz);
     if(clazz == NULL){

@@ -1,7 +1,7 @@
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE    := jpg
+LOCAL_MODULE    := codec_2_pic
 LOCAL_SRC_FILES += h264_to_jpg_jni.c
 
 LOCAL_C_INCLUDES += $(LOCAL_PATH)
